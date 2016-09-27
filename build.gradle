@@ -20,7 +20,7 @@ apply plugin: 'org.sonarqube'
 
 jar {
 	baseName = 'self-training'
-	version = '0.0.1'
+	version = '0.0.2-SNAPSHOT'
 }
 
 sourceCompatibility = 1.8
@@ -53,4 +53,8 @@ test {
 
 task logInfo {
 	logging.captureStandardOutput LogLevel.INFO
+}
+
+bootRun {
+	systemProperties = System.properties
 }

@@ -9,11 +9,13 @@ import com.getbase.services.UsersService;
 import com.getbase.sync.Meta;
 import com.getbase.sync.Sync;
 import lombok.extern.slf4j.Slf4j;
+
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -26,93 +28,47 @@ import static java.util.stream.Collectors.toList;
 @Component
 @Slf4j
 class WorkflowTask {
-    @Value("${workflow.salesrep.email.pattern}")
-    private String salesRepresentativeEmailPattern;
+    private List<String> salesRepresentativesEmails;
+    private List<String> accountManagersEmails;
 
-    @Value("${workflow.accountmanager.email.pattern}")
-    private String accountManagerEmailPattern;
+    private String accountManagerOnDutyEmail;
 
-    @Value("${workflow.account.manager.name}")
-    private String favouriteAccountManagerName;
-
-    @Value("${workflow.stage.first.name}")
-    private String firstStageName;
-
-    @Value("${workflow.stage.won.name}")
-    private String wonStageName;
-
-    @Value("${workflow.event.type.created.name}")
-    private String createdEventName;
-
-    @Value("${workflow.event.type.updated.name}")
-    private String updatedEventName;
-
-    @Value("${workflow.log.time.format}")
-    private String dateFormat;
-    private DateTimeFormatter logDateFormat;
+    private String dealNameDateFormat;
 
     private final Client baseClient;
 
-    private Sync sync;
-
     private final String deviceUuid;
 
-    private final Long firstStageId;
-    private final Long wonStageId;
+    @Autowired
+    public WorkflowTask(@Value("${workflow.deal.name.date.format}") String dealNameDateFormat) {
+        this.dealNameDateFormat = dealNameDateFormat;
 
-    private final List<Long> activeStageIds;
-
-    private WorkflowTask() {
         String accessToken = getAccessToken();
 
         baseClient = new Client(new Configuration.Builder()
                                         .accessToken(accessToken)
                                         .build());
 
-        firstStageId = getFirstStage().getId();
-        wonStageId = getWonStage().getId();
-
-        activeStageIds = baseClient.stages()
-                                    .list(new StagesService.SearchCriteria().active(true))
-                                    .stream()
-                                    .map(Stage::getId)
-                                    .collect(toList());
-
         deviceUuid = getDeviceUuid();
-    }
 
-    private Stage getWonStage() {
-        return baseClient.stages()
-                .list(new StagesService.SearchCriteria().name(wonStageName))
-                .stream()
-                .findFirst()
-                .orElseThrow(() -> new NoSuchElementException("Won stage of the pipeline not available"));
-    }
+        accountManagersEmails = getEmailsOfAccountManagers();
+        log.debug("accountManagersEmails=" + accountManagersEmails);
 
-    private Stage getFirstStage() {
-        return baseClient.stages()
-                .list(new StagesService.SearchCriteria().name(firstStageName))
-                .stream()
-                .findFirst()
-                .orElseThrow(() -> new NoSuchElementException("First (incoming) stage of the pipeline not available"));
-    }
+        accountManagerOnDutyEmail = getAccountManagerOnDuty();
+        log.debug("accountManagerOnDutyEmail=" + accountManagerOnDutyEmail);
 
-    @PostConstruct
-    private void initializeLogDateFormat() {
-        this.logDateFormat = DateTimeFormatter.ofPattern(dateFormat);
+        salesRepresentativesEmails = getEmailsOfSalesRepresentatives();
+        log.debug("salesRepresentativesEmails=" + salesRepresentativesEmails);
     }
-
 
     /**
      * Main workflow loop
      */
-    @Scheduled(fixedDelay = 5000)
+    @Scheduled(fixedDelayString = "${workflow.loop.interval}")
     public void runWorkflow() {
-        if (log.isInfoEnabled()) {
-            log.info("Time {}", logDateFormat.format(ZonedDateTime.now()));
-        }
+        log.info("Starting workflow run");
 
-        sync = new Sync(baseClient, deviceUuid);
+        Sync sync = new Sync(baseClient, deviceUuid);
 
         // Workaround: https://gist.github.com/michal-mally/73ea265718a0d29aac350dd81528414f
         sync.subscribe(Account.class, (meta, account) -> true)
@@ -132,39 +88,54 @@ class WorkflowTask {
                 .fetch();
     }
 
-    private boolean processContact(Meta meta, Contact contact) {
-        log.trace("Current contact={}", contact);
+    @SuppressWarnings("squid:S1192")
+    private boolean processContact(final Meta meta, final Contact contact) {
+        MDC.put("contactId", contact.getId().toString());
+        log.trace("Processing current contact");
 
         String eventType = meta.getSync().getEventType();
         log.trace("eventType={}", eventType);
-        if (eventType.contentEquals(createdEventName) || eventType.contentEquals(updatedEventName)) {
+        if (eventType.contentEquals("created") || eventType.contentEquals("updated")) {
             log.debug("Contact sync eventType={}", eventType);
 
-            if (shouldNewDealBeCreated(contact)) {
-                createNewDeal(contact);
+            MDC.clear();
+            try {
+                if (shouldNewDealBeCreated(contact)) {
+                    createNewDeal(contact);
+                }
+            } catch (RuntimeException e) {
+                log.error("Cannot process contact (id={}). Message={})", contact.getId(), e.getMessage(), e);
+            }
+
+        }
+        return true;
+    }
+
+    private boolean processDeal(final Meta meta, final Deal deal) {
+        MDC.put("dealId", deal.getId().toString());
+        log.trace("Processing current deal");
+
+        String eventType = meta.getSync().getEventType();
+        log.trace("Event type={}", eventType);
+        if (eventType.contentEquals("created") || eventType.contentEquals("updated")) {
+            log.debug("Deal sync event type={}", eventType);
+
+            try {
+                processRecentlyModifiedDeal(deal);
+            } catch (RuntimeException e) {
+                log.error("Cannot process deal (id={}). Message={})", deal.getId(), e.getMessage(), e);
             }
         }
         return true;
     }
 
-    private boolean processDeal(Meta meta, Deal deal) {
-        log.trace("Current deal={}", deal);
+    private void processRecentlyModifiedDeal(final Deal deal) {
+        log.trace("Processing recently modified deal");
 
-        String eventType = meta.getSync().getEventType();
-        log.trace("eventType={}", eventType);
-        if (eventType.contentEquals(createdEventName) || eventType.contentEquals(updatedEventName)) {
-            log.debug("Deal sync eventType={}", eventType);
-
-            verifyExistingDeal(deal);
-        }
-        return true;
-    }
-
-    private void verifyExistingDeal(Deal deal) {
         if (isDealStageWon(deal)) {
             log.info("Verifying deal in Won stage");
-            log.debug("Deal={}", deal);
 
+            MDC.clear();
             Contact dealsContact = fetchExistingContact(deal.getContactId());
             log.trace("Deal's contact={}", dealsContact);
 
@@ -177,16 +148,21 @@ class WorkflowTask {
         }
     }
 
-    private boolean updateExistingContact(Contact dealsContact) {
+    @SuppressWarnings("squid:S1192")
+    private boolean updateExistingContact(final Contact dealsContact) {
+        MDC.put("contactId", dealsContact.getId().toString());
         log.info("Updating contact's owner");
+        MDC.clear();
 
-        Long accountManagerId = Optional.ofNullable(getUserIdByName(favouriteAccountManagerName))
-                .orElseThrow(() -> new NoSuchElementException("User " + favouriteAccountManagerName + " not available"));
+        User accountManager = getUserByEmail(accountManagerOnDutyEmail)
+                                .orElseThrow(() -> new MissingResourceException("User not found",
+                                                                                "com.getbase.models.User",
+                                                                                accountManagerOnDutyEmail));
 
-        log.trace("accountManagerId={}", accountManagerId);
+        log.trace("Account Manager's Id={}", accountManager.getId());
 
         Map<String, Object> contactAttributes = new HashMap<>();
-        contactAttributes.put("owner_id", accountManagerId);
+        contactAttributes.put("owner_id", accountManager.getId());
         Contact updatedContact = baseClient.contacts()
                                         .update(dealsContact.getId(), contactAttributes);
 
@@ -195,79 +171,102 @@ class WorkflowTask {
         return true;
     }
 
-    private Long getUserIdByName(String name) {
-        List<User> foundUsers = baseClient.users()
-                                    .list(new UsersService.SearchCriteria().name(name));
-
-        return foundUsers.isEmpty() ? null : foundUsers.get(0).getId();
+    private Optional<User> getUserByEmail(final String email) {
+        return baseClient.users()
+                    .list(new UsersService.SearchCriteria().email(email))
+                    .stream()
+                    .findFirst();
     }
 
-    private boolean isContactOwnerAnAccountManager(User user) {
-        return user.getEmail()
-                .contains(accountManagerEmailPattern);
+    private boolean isContactOwnerAnAccountManager(final User user) {
+        return accountManagersEmails.contains(user.getEmail());
     }
 
-    private Contact fetchExistingContact(Long contactId) {
+    private Contact fetchExistingContact(final Long contactId) {
         return baseClient.contacts()
                 .get(contactId);
     }
 
-    private boolean isDealStageWon(Deal deal) {
-        return deal.getStageId()
-                .equals(wonStageId);
+    private boolean isDealStageWon(final Deal deal) {
+        return baseClient.stages()
+                .list(new StagesService.SearchCriteria().active(false))
+                .stream()
+                .anyMatch(s -> s.getCategory().contentEquals("won") && deal.getStageId() == s.getId());
     }
 
-    private void createNewDeal(Contact newContact) {
+    @SuppressWarnings("squid:S1192")
+    private void createNewDeal(final Contact newContact) {
+        MDC.put("contactId", newContact.getId().toString());
         log.info("Creating new deal");
 
-        Map<String, Object> newDealAttributes = new HashMap<>();
-        newDealAttributes.put("contact_id", newContact.getId());
-        String dealName = newContact.getName() + " " + ZonedDateTime.now()
-                                                            .toLocalDate()
-                                                            .format(DateTimeFormatter.ISO_LOCAL_DATE);
-        newDealAttributes.put("name", dealName);
-        newDealAttributes.put("owner_id", newContact.getOwnerId());
-        newDealAttributes.put("stage_id", firstStageId);
+        DateTimeFormatter selectedFormatter;
+        try {
+            selectedFormatter = DateTimeFormatter.ofPattern(dealNameDateFormat);
+        } catch (IllegalArgumentException e) {
+            log.error("Illegal date format. Property workflow.deal.name.date.format={} Message={}",
+                        dealNameDateFormat,
+                        e.getMessage(),
+                        e);
+            log.error("Setting default to ISO local date format: yyyy-MM-dd");
 
-        Deal newDeal = baseClient.deals()
-                            .create(newDealAttributes);
+            selectedFormatter = DateTimeFormatter.ISO_LOCAL_DATE;
+        }
 
-        log.debug("Created new deal={}", newDeal);
+        String dateSuffix = ZonedDateTime.now()
+                .toLocalDate()
+                .format(selectedFormatter);
+
+        String dealName = newContact.getName() + " " + dateSuffix;
+
+        Deal newDeal = new Deal();
+        newDeal.setName(dealName);
+        newDeal.setContactId(newContact.getId());
+        newDeal.setOwnerId(newContact.getOwnerId());
+
+        Deal newlyCreatedDeal = baseClient.deals()
+                                            .create(newDeal);
+
+        MDC.clear();
+        log.debug("Created new deal={}", newlyCreatedDeal);
     }
 
-    private boolean shouldNewDealBeCreated(Contact contact) {
-        Boolean isContactACompany = contact.getIsOrganization();
-        log.trace("isContactACompany={}", isContactACompany);
+    private boolean shouldNewDealBeCreated(final Contact contact) {
+        boolean isContactACompany = contact.getIsOrganization();
+        log.trace("Is current contact a company={}", isContactACompany);
 
-        Long ownerId = contact.getOwnerId();
+        long ownerId = contact.getOwnerId();
         User owner = fetchOwner(ownerId);
         log.trace("Contact's owner={}", owner);
 
-        Long contactId = contact.getId();
+        long contactId = contact.getId();
         log.trace("Contact's id={}", contactId);
 
-        Boolean isUserSalesRepresentative = owner.getEmail()
-                                                    .contains(salesRepresentativeEmailPattern);
-        log.trace("isUserSalesRepresentative={}", isUserSalesRepresentative);
+        boolean isUserSalesRepresentative = salesRepresentativesEmails.contains(owner.getEmail());
+        log.trace("Is contact's owner a sales representative={}", isUserSalesRepresentative);
 
-        log.trace("No deals found={}", areNoActiveDealsFound(contactId));
+        boolean activeDealsMissing = areNoActiveDealsFound(contactId);
+        log.trace("No deals found={}", activeDealsMissing);
 
-        boolean result = isContactACompany && isUserSalesRepresentative && areNoActiveDealsFound(contactId);
+        boolean result = isContactACompany && isUserSalesRepresentative && activeDealsMissing;
         log.debug("Should new deal be created={}", result);
 
         return result;
     }
 
-    private boolean areNoActiveDealsFound(Long contactId) {
+    private boolean areNoActiveDealsFound(final Long contactId) {
+        List<Long> activeStageIds = baseClient.stages()
+                                                        .list(new StagesService.SearchCriteria().active(true))
+                                                        .stream()
+                                                        .map(Stage::getId)
+                                                        .collect(toList());
+
         return baseClient.deals()
                             .list(new DealsService.SearchCriteria().contactId(contactId))
                             .stream()
-                            .filter(d -> activeStageIds.contains(d.getStageId()))
-                            .collect(toList())
-                            .isEmpty();
+                            .noneMatch(d -> activeStageIds.contains(d.getStageId()));
     }
 
-    private User fetchOwner(long userId) {
+    private User fetchOwner(final long userId) {
         return baseClient.users()
                     .get(userId);
     }
@@ -280,5 +279,39 @@ class WorkflowTask {
     private String getDeviceUuid() {
         return Optional.ofNullable(System.getProperty("DEVICE_UUID", System.getenv("DEVICE_UUID"))).
                 orElseThrow(() -> new IllegalStateException("Missing Base CRM device uuid"));
+    }
+
+    private List<String> getEmailsOfSalesRepresentatives() {
+        String emails = System.getProperty("workflow.sales.representatives.emails",
+                                System.getenv("workflow_sales_representatives_emails"));
+        log.trace("Sales representatives emails (raw)={}", emails);
+
+        return Arrays.stream(Optional.ofNullable(emails)
+                        .orElseThrow(() -> new IllegalStateException("Empty list of sales representatives' emails"))
+                        .split(","))
+                        .map(String::trim)
+                        .collect(toList());
+    }
+
+    private List<String> getEmailsOfAccountManagers() {
+        String emails = System.getProperty("workflow.account.managers.emails",
+                                System.getenv("workflow_account_managers_emails"));
+        log.trace("Account managers emails (raw)={}", emails);
+
+        return Arrays.stream(Optional.ofNullable(emails)
+                        .orElseThrow(() -> new IllegalStateException("Empty list of account managers emails"))
+                        .split(","))
+                        .map(String::trim)
+                        .collect(toList());
+    }
+
+    private String getAccountManagerOnDuty() {
+        String email = System.getProperty("workflow.account.manager.on.duty.email",
+                                System.getenv("workflow_account_manager_on_duty_email"));
+        log.trace("Account manager on duty email={}", email);
+
+        return Optional.ofNullable(email)
+                .orElseThrow(() -> new IllegalStateException("Empty email of the manager on duty"))
+                .trim();
     }
 }
